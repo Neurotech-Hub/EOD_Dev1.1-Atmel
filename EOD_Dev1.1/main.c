@@ -7,33 +7,36 @@
 #define MYUBRR F_CPU/16/BAUD-1
 #define LED_PIN PA2              // Define as the LED pin for blinking
 #define FRAM_CS_PIN PA7          // Chip Select for FRAM
-#define MAGNET_SENSOR_PIN PB2 
+#define MAGNET_SENSOR_PIN PB2 // PCINT10
 
-// Initialize the magnetic sensor as an input with an interrupt
+void USART0_Transmit_16bit_with_frame(int16_t data);
 void magnetic_sensor_init(void)
 {
-	// Set PB3 as input
+	// Set PB2 as input
 	DDRB &= ~(1 << MAGNET_SENSOR_PIN);
 
-	// Enable internal pull-up resistor on PB3 (active LOW sensor)
+	// Enable internal pull-up resistor on PB2 (active LOW sensor)
 	PORTB |= (1 << MAGNET_SENSOR_PIN);
 
-	// Enable pin change interrupt on PB3 (PCINT11)
-	PCMSK1 |= (1 << PCINT11); // Enable pin change interrupt for PB3
-	GIMSK |= (1 << PCIE1);    // Enable pin change interrupts for PCINT[11:8]
+	// Enable pin change interrupt on PB2 (PCINT10)
+	PCMSK1 |= (1 << PCINT10);  // Enable pin change interrupt mask for PB2
+
+	// Enable pin change interrupt for PCINT[11:8] group
+	GIMSK |= (1 << PCIE1);     // Enable PCINT1 group interrupts (PCINT[11:8])
+
+	// Enable global interrupts
+	sei();
 }
 
-// ISR for handling pin change interrupts on PCINT[11:8] (PB3, PB2, PB1, PB0)
+// ISR for Pin Change Interrupt on PCINT[11:8]
 ISR(PCINT1_vect)
 {
-	// Check if PB3 is low (magnet is applied)
-	if (!(PINB & (1 << MAGNET_SENSOR_PIN)))
-	{
-		//blink_LED();
-	}
-	else
-	{
-		// Magnet removed (PB3 is HIGH)
+	if (!(PINB & (1 << MAGNET_SENSOR_PIN))) {
+		// Magnet applied, turn LED on
+		PORTA |= (1 << LED_PIN);  // Set PB1 high to turn on the LED
+		} else {
+		// Magnet not applied, turn LED off
+		PORTA &= ~(1 << LED_PIN);  // Set PB1 low to turn off the LED
 	}
 }
 
@@ -127,7 +130,7 @@ int16_t ADC_read(void)
 
 void blink_LED(void)
 {
-	PORTA ^= (1 << LED_PIN); // Toggle
+	PORTB ^= (1 << LED_PIN); // Toggle
 }
 
 void USART0_Init(unsigned int ubrr)
@@ -169,25 +172,23 @@ void USART0_Transmit_16bit_with_frame(int16_t data)
 
 int main(void)
 {
-	ADC_init();             // Initialize ADC for differential input on PA0 and PA1
+	DDRA |= (1 << LED_PIN); // LED as output
+	//ADC_init();
 	//SPI_init();             // Initialize SPI for FRAM communication
-	//magnetic_sensor_init(); // Initialize magnetic sensor with interrupt on PB3
+	magnetic_sensor_init();
 
 	// Example of writing and reading from FRAM
 	// FRAM_write(0x0000, 0xBA);              // Write 0xAA to address 0x0000
 	// uint8_t read_data = FRAM_read(0x0000); // Read from address 0x0000
-	//sei(); // Enable global interrupts
 	
 	USART0_Init(MYUBRR); // Initialize USART0 with calculated baud rate
 
 	while (1)
 	{
-		int16_t adc_value = ADC_read(); // Read ADC value
-		USART0_Transmit_16bit_with_frame(adc_value);
-
-		// Blink PA3 every time ADC is sampled
+		//int16_t adc_value = ADC_read(); // Read ADC value
+		//USART0_Transmit_16bit_with_frame(adc_value);
 		//blink_LED();
-		//USART0_Transmit(0x55);
+		
 
 		_delay_ms(20); // Delay between readings (and LED toggles)
 	}
