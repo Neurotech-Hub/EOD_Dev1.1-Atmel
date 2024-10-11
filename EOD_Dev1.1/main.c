@@ -3,14 +3,11 @@
 #include <util/delay.h>
 #include <avr/interrupt.h>
 
-#define BAUD 2400
-#define BIT_DELAY _delay_us(365) // Adjust for 9600 baud
-#define TX_PIN PA2               // Define PA2 as the TX pin for software UART
-#define LED_PIN PA3              // Define PA3 as the LED pin for blinking
+#define BAUD 4800
+#define MYUBRR F_CPU/16/BAUD-1
+#define LED_PIN PA2              // Define as the LED pin for blinking
 #define FRAM_CS_PIN PA7          // Chip Select for FRAM
-#define MAGNET_SENSOR_PIN PB3    // PB3 as the magnetic sensor pin
-
-void blinkLED(void);
+#define MAGNET_SENSOR_PIN PB2 
 
 // Initialize the magnetic sensor as an input with an interrupt
 void magnetic_sensor_init(void)
@@ -93,38 +90,6 @@ uint8_t FRAM_read(uint16_t address)
 	return data;
 }
 
-void soft_serial_init(void)
-{
-	DDRA |= (1 << TX_PIN);  // Set PA2 as output for software serial
-	PORTA |= (1 << TX_PIN); // Set PA2 high (idle state)
-	DDRA |= (1 << LED_PIN); // Set PA3 as output for LED
-}
-
-void soft_serial_send(uint8_t data)
-{
-	// Start bit (pull line low)
-	PORTA &= ~(1 << TX_PIN);
-	BIT_DELAY;
-
-	// Send 8 data bits (LSB first)
-	for (uint8_t i = 0; i < 8; i++)
-	{
-		if (data & (1 << i))
-		{
-			PORTA |= (1 << TX_PIN); // Send 1
-		}
-		else
-		{
-			PORTA &= ~(1 << TX_PIN); // Send 0
-		}
-		BIT_DELAY;
-	}
-
-	// Stop bit (set line high)
-	PORTA |= (1 << TX_PIN);
-	BIT_DELAY;
-}
-
 void ADC_init(void)
 {
 	// Clear PRADC bit to enable ADC power
@@ -134,7 +99,7 @@ void ADC_init(void)
 	ADMUXB = (1 << REFS1); // REFS1 = 1 selects 1.1V internal reference
 
 	// Select differential input: PA0 (ADC0) - PA1 (ADC1), with gain 1x
-	ADMUXA = 0x10; // 01 0000: Differential input on PA0 and PA1, gain 1x
+	ADMUXA = 0x11; // 01 0001 (0x11): Differential input on PA0 and PA3, gain 1x
 
 	// Enable ADC and set prescaler to 64 (for 125kHz ADC clock with 1 MHz F_CPU)
 	ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1); // ADC enable, prescaler=64
@@ -157,46 +122,73 @@ int16_t ADC_read(void)
 	{                     // Check if the 10th bit (sign bit) is set
 		result |= 0xFC00; // If yes, extend the sign by setting the upper bits
 	}
-
 	return result;
 }
 
 void blink_LED(void)
 {
-	PORTA ^= (1 << LED_PIN); // Toggle PA3 to blink LED
+	PORTA ^= (1 << LED_PIN); // Toggle
+}
+
+void USART0_Init(unsigned int ubrr)
+{
+	// Set baud rate
+	UBRR0H = (unsigned char)(ubrr>>8);
+	UBRR0L = (unsigned char)ubrr;
+
+	// Enable transmitter
+	UCSR0B = (1<<TXEN0);
+
+	// Set frame format: 8 data bits, no parity, 1 stop bit
+	UCSR0C = (1<<UCSZ01) | (1<<UCSZ00);
+}
+
+void USART0_Transmit(unsigned char data)
+{
+	// Wait for empty transmit buffer
+	while (!(UCSR0A & (1<<UDRE0)));
+
+	// Put data into buffer, sends the data
+	UDR0 = data;
+}
+
+void USART0_Transmit_16bit_with_frame(int16_t data)
+{
+	// Send start byte
+	USART0_Transmit(0xAA);                // Start of frame
+	
+	// Send the high byte
+	USART0_Transmit((data >> 8) & 0xFF);  // Transmit the upper 8 bits
+	
+	// Send the low byte
+	USART0_Transmit(data & 0xFF);         // Transmit the lower 8 bits
+	
+	// Optionally send an end byte
+	// USART0_Transmit(0x55);             // End of frame (optional)
 }
 
 int main(void)
 {
-	soft_serial_init();     // Initialize software serial on PA2 and LED on PA3
 	ADC_init();             // Initialize ADC for differential input on PA0 and PA1
-	SPI_init();             // Initialize SPI for FRAM communication
-	magnetic_sensor_init(); // Initialize magnetic sensor with interrupt on PB3
-
-	soft_serial_send(0x55); // send for baud rate detection
-
-	_delay_ms(1000); // Delay between readings (and LED toggles)
+	//SPI_init();             // Initialize SPI for FRAM communication
+	//magnetic_sensor_init(); // Initialize magnetic sensor with interrupt on PB3
 
 	// Example of writing and reading from FRAM
 	// FRAM_write(0x0000, 0xBA);              // Write 0xAA to address 0x0000
 	// uint8_t read_data = FRAM_read(0x0000); // Read from address 0x0000
-	//soft_serial_send(read_data);           // Send the read byte over software UART
-	//_delay_ms(1000); // Delay between readings (and LED toggles)
-
 	//sei(); // Enable global interrupts
+	
+	USART0_Init(MYUBRR); // Initialize USART0 with calculated baud rate
 
 	while (1)
 	{
 		int16_t adc_value = ADC_read(); // Read ADC value
+		USART0_Transmit_16bit_with_frame(adc_value);
 
 		// Blink PA3 every time ADC is sampled
-		blink_LED();
+		//blink_LED();
+		//USART0_Transmit(0x55);
 
-		// Send ADC high and low byte over software serial
-		soft_serial_send((adc_value >> 8) & 0xFF); // Send high byte
-		soft_serial_send(adc_value & 0xFF);        // Send low byte
-		//soft_serial_send(0x55);
-
-		_delay_ms(30); // Delay between readings (and LED toggles)
+		_delay_ms(20); // Delay between readings (and LED toggles)
 	}
 }
