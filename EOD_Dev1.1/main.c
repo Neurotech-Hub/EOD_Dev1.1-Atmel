@@ -2,14 +2,82 @@
 #include <avr/io.h>
 #include <util/delay.h>
 #include <avr/interrupt.h>
+#include <stdlib.h>
 
 #define BAUD 4800
+#define BUFFER_SIZE 64
+#define HALF_BUFFER_SIZE (BUFFER_SIZE / 2)  // Half buffer size for centering
+#define THRESHOLD 200
 #define MYUBRR F_CPU/16/BAUD-1
-#define LED_PIN PA2              // Define as the LED pin for blinking
+#define LED_PIN PA2
 #define FRAM_CS_PIN PA7          // Chip Select for FRAM
 #define MAGNET_SENSOR_PIN PB2 // PCINT10
 
+volatile uint8_t start_sampling = 0;  // Flag to trigger sampling in main loop
+int16_t adc_buffer[BUFFER_SIZE];      // Buffer to store ADC samples
+int buffer_index = 0;                 // Current index in the circular buffer
+volatile uint8_t threshold_crossed = 0;  // Flag for threshold crossing
+
 void USART0_Transmit_16bit_with_frame(int16_t data);
+int16_t ADC_read(void);
+
+void sampling_and_transmit(void)
+{
+	int16_t adc_value;
+	int event_index = -1;  // To record the index when threshold is crossed
+	buffer_index = 0;      // Reset the circular buffer index
+
+	// Continuously sample and fill the circular buffer
+	for (int i = 0; i < BUFFER_SIZE; i++) {
+		adc_buffer[buffer_index] = ADC_read();
+		buffer_index = (buffer_index + 1) % BUFFER_SIZE;
+	}
+
+	// Now sample until the threshold is crossed
+	while (!threshold_crossed) {
+		// Read ADC value
+		adc_value = ADC_read();
+
+		// Store ADC value in circular buffer (wrap-around)
+		adc_buffer[buffer_index] = adc_value;
+		buffer_index = (buffer_index + 1) % BUFFER_SIZE;
+
+		// Check if the threshold has been crossed
+		if (abs(adc_value) > THRESHOLD) {
+			threshold_crossed = 1;
+			// Save the index where the threshold was crossed
+			event_index = (buffer_index - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+		}
+	}
+
+	// Continue sampling until the buffer is fully populated post-threshold
+	for (int i = 0; i < HALF_BUFFER_SIZE; i++) {
+		adc_buffer[buffer_index] = ADC_read();
+		buffer_index = (buffer_index + 1) % BUFFER_SIZE;
+	}
+
+	// Now we need to rearrange the buffer to center the threshold event
+	int centered_buffer[BUFFER_SIZE];  // Temporary buffer for centered waveform
+
+	// Calculate start position to center the threshold crossing
+	int start_index = (event_index - HALF_BUFFER_SIZE + BUFFER_SIZE) % BUFFER_SIZE;
+
+	// Rearrange the circular buffer to center the threshold event
+	for (int i = 0; i < BUFFER_SIZE; i++) {
+		centered_buffer[i] = adc_buffer[(start_index + i) % BUFFER_SIZE];
+	}
+
+	// Transmit the centered buffer over USART
+	for (int i = 0; i < BUFFER_SIZE; i++) {
+		USART0_Transmit_16bit_with_frame(centered_buffer[i]);
+		_delay_ms(20);  // Optional delay between transmissions
+	}
+
+	// Reset the threshold flag for the next event
+	threshold_crossed = 0;
+}
+
+
 void magnetic_sensor_init(void)
 {
 	// Set PB2 as input
@@ -33,10 +101,11 @@ ISR(PCINT1_vect)
 {
 	if (!(PINB & (1 << MAGNET_SENSOR_PIN))) {
 		// Magnet applied, turn LED on
-		PORTA |= (1 << LED_PIN);  // Set PB1 high to turn on the LED
+		PORTA |= (1 << LED_PIN);  // turn on the LED
+		start_sampling = 1; // trigger ADC sample/transfer
 		} else {
 		// Magnet not applied, turn LED off
-		PORTA &= ~(1 << LED_PIN);  // Set PB1 low to turn off the LED
+		PORTA &= ~(1 << LED_PIN);  // turn off the LED
 	}
 }
 
@@ -95,17 +164,11 @@ uint8_t FRAM_read(uint16_t address)
 
 void ADC_init(void)
 {
-	// Clear PRADC bit to enable ADC power
-	PRR &= ~(1 << PRADC);
-
-	// Set the voltage reference to 1.1V internal reference (REFS1 = 1)
-	ADMUXB = (1 << REFS1); // REFS1 = 1 selects 1.1V internal reference
-
-	// Select differential input: PA0 (ADC0) - PA1 (ADC1), with gain 1x
+	PRR &= ~(1 << PRADC); // Clear PRADC bit to enable ADC power
+	//ADMUXB = (1 << REFS1); // REFS1 = 1 selects 1.1V internal reference
+	ADMUXB = (1 << REFS1) | (1 << GSEL0);
 	ADMUXA = 0x11; // 01 0001 (0x11): Differential input on PA0 and PA3, gain 1x
-
-	// Enable ADC and set prescaler to 64 (for 125kHz ADC clock with 1 MHz F_CPU)
-	ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1); // ADC enable, prescaler=64
+	ADCSRA = (1 << ADEN) | (1 << ADPS2); // | (1 << ADPS0); // ADC enable, prescaler=32
 }
 
 int16_t ADC_read(void)
@@ -114,19 +177,22 @@ int16_t ADC_read(void)
 	ADCSRA |= (1 << ADSC);
 
 	// Wait for conversion to complete
-	while (ADCSRA & (1 << ADSC))
-	;
+	while (ADCSRA & (1 << ADSC));
 
-	// Read the result from ADCL and ADCH
-	int16_t result = (ADCL | (ADCH << 8));
+	// Read the low byte first, then the high byte
+	uint8_t low_byte = ADCL;
+	uint8_t high_byte = ADCH;
 
-	// Sign extend the 10-bit result (considering the result is in two's complement form)
-	if (result & 0x0200)
-	{                     // Check if the 10th bit (sign bit) is set
-		result |= 0xFC00; // If yes, extend the sign by setting the upper bits
+	// Combine the low and high bytes
+	int16_t result = (high_byte << 8) | low_byte;
+
+	// Sign extend the 10-bit result
+	if (result & 0x0200) {   // Check if the 10th bit (sign bit) is set
+		result |= 0xFC00;    // Sign extend the upper bits
 	}
 	return result;
 }
+
 
 void blink_LED(void)
 {
@@ -173,7 +239,7 @@ void USART0_Transmit_16bit_with_frame(int16_t data)
 int main(void)
 {
 	DDRA |= (1 << LED_PIN); // LED as output
-	//ADC_init();
+	ADC_init();
 	//SPI_init();             // Initialize SPI for FRAM communication
 	magnetic_sensor_init();
 
@@ -185,11 +251,13 @@ int main(void)
 
 	while (1)
 	{
-		//int16_t adc_value = ADC_read(); // Read ADC value
-		//USART0_Transmit_16bit_with_frame(adc_value);
-		//blink_LED();
-		
+		// Check if the flag is set by the interrupt
+		if (start_sampling) {
+			// Start sampling and transmitting
+			sampling_and_transmit();
 
-		_delay_ms(20); // Delay between readings (and LED toggles)
+			// Reset the flag to wait for the next trigger
+			start_sampling = 0;
+		}
 	}
 }
